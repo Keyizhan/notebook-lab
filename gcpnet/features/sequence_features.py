@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch_geometric.data import Batch, Data
 
-from models.gcpnet.typecheck import typechecker
+from gcpnet.typecheck import typechecker
 
 
 @typechecker

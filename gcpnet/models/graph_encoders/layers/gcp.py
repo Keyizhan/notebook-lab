@@ -59,7 +59,7 @@ from ...utils import (
     is_identity,
     safe_norm,
 )
-from models.gcpnet.typecheck import jaxtyped, typechecker
+from gcpnet.typecheck import jaxtyped, typechecker
 
 try:  # Optional dependency for backwards compatibility
     from omegaconf import DictConfig, OmegaConf  # type: ignore

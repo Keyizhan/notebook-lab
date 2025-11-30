@@ -1,6 +1,6 @@
 import torch
 
-from models.gcpnet.typecheck import jaxtyped, typechecker
+from gcpnet.typecheck import jaxtyped, typechecker
 
 
 @jaxtyped(typechecker=typechecker)

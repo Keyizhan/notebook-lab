@@ -16,7 +16,7 @@ from torch_geometric.nn import (
 )
 
 from ..types import ActivationType
-from models.gcpnet.typecheck import jaxtyped, typechecker
+from gcpnet.typecheck import jaxtyped, typechecker
 
 
 def _extract_batch_info(batch_like: Union[Batch, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, int]:

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from jaxtyping import Float
 
-from models.gcpnet.typecheck import jaxtyped, typechecker
+from gcpnet.typecheck import jaxtyped, typechecker
 
 
 class CachedGaussianRBF(torch.nn.Module):

@@ -17,7 +17,7 @@ from ..utils import (
     localize,
 )
 from ...types import EncoderOutput
-from models.gcpnet.typecheck import jaxtyped, typechecker
+from gcpnet.typecheck import jaxtyped, typechecker
 
 
 class GCPNetModel(torch.nn.Module):

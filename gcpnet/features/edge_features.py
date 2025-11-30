@@ -11,7 +11,7 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when OmegaConf is una
 from torch_geometric.data import Batch, Data
 
 from .utils import _normalize
-from models.gcpnet.typecheck import jaxtyped, typechecker
+from gcpnet.typecheck import jaxtyped, typechecker
 
 
 @jaxtyped(typechecker=typechecker)

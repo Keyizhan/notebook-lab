@@ -1,261 +1,42 @@
-## notebook-lab：VQ-VAE + GCPNet 端到端流水线
+# Protein-Ligand Binding Site Analysis & VQ-VAE Training Pipeline
 
-本仓库包含一个基于 **GCPNet 图编码器 + Transformer VQ-VAE** 的端到端流水线，用于对蛋白–配体结合位点的局部环境进行离散化表示学习（binding codes）。
+本项目提供从 PDB 复合物分析到 VQ-VAE 离散码本训练的完整流水线，包括：
 
-下面的 README 总结了主要脚本、数据流程和训练方式，便于快速上手和回顾。
-
----
-
-## 1. 总体架构概览
-
-- **目标**：
-  - 对蛋白–配体结合位点的局部环境进行离散化表示学习
-  - 学到可用于分析和下游任务的离散 code（codebook indices）
-
-- **输入**：
-  - PDB 复合物（蛋白 + 配体），位于 `complex-20251129T063258Z-1-001/complex/*.pdb`
-
-- **中间表示**：
-  - 使用 GCPNet 对三张图进行编码：
-    - 蛋白图（Protein graph）
-    - 配体图（Ligand graph）
-    - 相互作用图（Protein–Ligand interaction graph）
-  - 同时提取局部边级几何特征（距离、方向、alpha/kappa/dihedral 等）
-
-- **输出**：
-  - 一个高维边级融合特征矩阵（例如 641 维）
-  - VQ-VAE 学到的离散 codebook 以及重建特征（用于评估与下游任务）
-
-- **实现拆分为两大部分**：
-  - 特征提取（离线脚本）：`feature extraction/full_pipeline.py`
-  - 端到端训练（Notebook）：`end_to_end_vqvae_training.ipynb`
-
-- **核心模型文件**：
-  - `vqvae.py`
-    - 定义 `VQVAETransformer`，负责 Transformer 编码 + Vector Quantization
-    - 支持 TikTok 压缩、Residual VQ、多层 codebook、正交正则等
-  - `gcpnet/`
-    - 包含 GCPNet 图编码器、几何特征提取、各类层与 head
-    - 用于蛋白/配体/相互作用三种图的表示学习
+1. 批量分析蛋白-配体复合物结构，识别关键结合位点
+2. 使用 GCPNet 图神经网络提取三图（蛋白口袋图、配体图、相互作用图）的几何嵌入特征
+3. 构建边级融合特征并训练 VQ-VAE 离散码本
 
 ---
 
-## 2. 特征提取流水线（`feature extraction/full_pipeline.py`）
+## 📋 项目概览
 
-### 2.1 功能与输入输出
+### 主要功能
 
-**功能总览**：
+1. **PDB 复合物批量解析**：自动识别蛋白-配体接触界面的关键残基
+2. **三图构建与特征提取**：
+   - 蛋白 binding 残基图（Cα 节点 + KNN 图）
+   - 配体原子图（原子节点 + KNN 图）
+   - 蛋白-配体相互作用图（跨模态边）
+3. **GCPNet 编码**：使用预配置的 GCPNet 模型对三类图分别编码并拼接，生成高维嵌入向量
+4. **边级特征融合**：提取相互作用图的边级局部特征并融合三图 embedding
+5. **VQ-VAE 离散码本训练**：
+   - Edge 级几何码本（简化版）
+   - 完整 VQ-VAE 训练（Transformer + Vector Quantizer + Geometric Decoder）
 
-- 从 PDB 复合物中识别蛋白–配体接触残基（binding sites）
-- 基于接触残基构建三张图：
-  - 蛋白图（Protein graph）
-  - 配体图（Ligand graph）
-  - 相互作用图（Protein–Ligand interaction graph）
-- 使用完整版 GCPNet 编码器获取三张图的 embedding
-- 提取局部边级几何特征（含 alpha/kappa/二面角等）
-- 将 embedding 与局部边级特征进行融合，生成最终 **边级融合特征矩阵**
-- 所有结果以 HDF5 格式保存到 `improtant data/` 目录
+### 适用场景
 
-**输入目录**：
-
-- PDB 复合物：`complex-20251129T063258Z-1-001/complex/*.pdb`
-
-**主要输出 HDF5 文件**（均位于 `improtant data/`）：
-
-- `binding_sites.h5`：
-  - 蛋白–配体接触残基信息（PDB id、链、残基号、距离等）
-- `binding_embeddings_protein.h5`：
-  - 蛋白图级 embedding（每个样本一个向量）
-- `binding_embeddings_ligand.h5`：
-  - 配体图级 embedding
-- `binding_embeddings_interaction.h5`：
-  - 相互作用图级 embedding
-- `binding_edge_features.h5`：
-  - 边级局部几何特征（不含图级 embedding）
-- `binding_edge_features_fused.h5`：
-  - 最终用于 VQ-VAE 训练的融合边特征
-  - `features`：形状约为 `(N_edges, 641)`，由以下部分拼接：
-    - 纯边级局部特征
-    - 蛋白图 embedding
-    - 配体图 embedding
-    - 相互作用图 embedding
-  - `graph_index`：指示每条边属于哪一个样本/图
-  - 其他元信息：`pdb_id`, `ligand_resname` 等
-
-### 2.2 PDB 复合物分析（接触识别）
-
-- 入口函数：`analyze_all_pdbs(pdb_dir: Path) -> pd.DataFrame`
-- 核心步骤：
-  - `split_protein_and_ligands(structure)`：
-    - 将结构中残基划分为蛋白残基和小分子配体残基
-    - 过滤掉水、金属离子等不关心的 HETATM
-  - `compute_contacts_for_structure(pdb_path: Path)`：
-    - 枚举所有蛋白残基–配体残基对，计算最小原子–原子距离
-    - 若小于 `DIST_CUTOFF = 4.0 Å` 则记为一条接触记录
-  - 接触信息通过 `save_binding_sites_to_h5(df, BINDING_SITES_H5)` 写入 HDF5
-
-### 2.3 三图构建与 GCPNet 编码
-
-**蛋白图构建与编码**：
-
-- `build_pyg_data_for_group(...)`：
-  - 根据 binding site 分组，从 PDB 构建蛋白图
-  - 节点：氨基酸/原子
-  - 边：KNN 或距离约束
-- 使用 `ProteinFeaturiser`（`gcpnet.features.factory`）：
-  - 生成标量特征（氨基酸类型、B-factor、二级结构等）
-  - 生成向量特征（坐标、方向、几何量等）
-- `encode_protein_graph(batch)`：
-  - 调用 `GCPNetModel`，返回：
-    - `node_embedding`
-    - `graph_embedding`（图级向量，用于融合到边特征）
-
-**配体图构建与编码**：
-
-- `build_ligand_graph_from_pdb(...)`：
-  - 从 PDB 中抽取配体残基，构建小分子图（节点为原子，边为化学键/距离邻居）
-- `encode_ligand_graph(ligand_data_list)`：
-  - 使用 GCPNet 架构（替代原先的 Simple MLP）
-  - 返回每个样本的图级 embedding
-
-**相互作用图构建与编码**：
-
-- `build_interaction_graph(protein_data, ligand_data)`：
-  - 基于空间邻近，在蛋白原子与配体原子之间建立“相互作用边”
-  - 节点带有角色编码（蛋白/配体）
-- `encode_interaction_graph(inter_data_list)` / `encode_interaction_graph_nodes(...)`：
-  - 图级 embedding：用于全局语义
-  - 节点级 embedding：可用于后续边级特征拼接
-
-### 2.4 边级局部特征与融合
-
-- 边级局部特征提取：`compute_and_save_edge_features(...)`
-  - 对每一条“蛋白–配体接触边”构建局部几何特征：
-    - 距离、方向向量
-    - 局部坐标系相关量：alpha / kappa / dihedral angles 等
-    - 氨基酸类型、原子类型 one-hot 或嵌入
-- 特征融合与最终 HDF5 输出：`fuse_and_save_edge_features(...)`（名称以实际代码为准）
-  - 对每条边，将以下部分进行串联（cat）：
-    - 纯局部几何特征向量
-    - 对应样本的蛋白图 embedding
-    - 对应样本的配体图 embedding
-    - 对应样本的相互作用图 embedding
-  - 保存为 `binding_edge_features_fused.h5`，并在 attrs 中记录：
-    - `feature_dim`
-    - `protein_emb_dim`
-    - `ligand_emb_dim`
-    - `interaction_emb_dim`
-    - `edge_feature_dim`
+- 蛋白-配体结合位点识别
+- 药物-靶标相互作用预测
+- 虚拟筛选与药物设计
+- 结构生物学数据挖掘
+- 蛋白质结构生成与压缩
+- 离散表示学习
 
 ---
 
-## 3. 端到端 VQ-VAE 训练（`end_to_end_vqvae_training.ipynb`）
+## 📁 目录结构
 
-### 3.1 数据与环境配置
-
-- 基准路径：
-  - `BASE_DIR = c:/Users/Administrator/Desktop/IGEM/stage1/notebook-lab`
-- 输入数据：
-  - `H5_DATA_PATH = BASE_DIR / 'improtant data' / 'binding_edge_features_fused.h5'`
-- Checkpoint 目录：
-  - `CHECKPOINT_DIR = BASE_DIR / 'checkpoints' / 'vqvae_end_to_end'`
-- 配置文件：
-  - `config_vqvae.yaml`：Transformer + VQ-VAE 配置
-  - `config_gcpnet_encoder.yaml`：GCPNet 模型与特征提取配置
-- Notebook 中提供：
-  - HDF5 数据存在性检查
-  - 自动运行 `feature extraction/full_pipeline.py` 生成数据的单元格
-  - 如果 `binding_edge_features_fused.h5` 不存在，将通过 `importlib` 加载并执行 `full_pipeline.main()`
-
-### 3.2 数据集定义：`EdgeFeatureDataset`
-
-- 基于 HDF5 构造 PyTorch `Dataset`：
-  - 加载：
-    - `features`：`(N_edges, feature_dim)`
-    - `graph_index`：`(N_edges,)`
-    - `pdb_id`, `ligand_resname` 等
-  - 每个 `__getitem__` 返回一个“样本图”的边特征矩阵：
-    - 固定长度 `max_edges_per_sample = 512`
-    - 超过则截断，不足则用 0 padding，并提供 `mask`
-  - 输出：
-    - `padded_features`：`(max_edges, feature_dim)`
-    - `mask`：`(max_edges,)`，1 为有效边，0 为 padding
-- 使用 `DataLoader` 封装为 batch：
-  - `edge_feats`：`(B, L, feature_dim)`，目前 `feature_dim = 641`
-  - `mask`：`(B, L)`
-
-### 3.3 模型结构与配置
-
-Notebook 内组装了一个端到端结构：
-
-- **GCPNet Encoder + Featuriser**（来自 `gcpnet` 包）
-  - 在端到端训练模式下，GCPNet 参数默认是可训练的，梯度可以回传
-
-- **Feature Projector**
-  - 将 641 维边级特征投影到 VQ-VAE 输入维度（通常 128 维）：
-  - 形状变化：`(B, L, 641) → (B, L, 128)`
-
-- **VQ-VAE 模型（`VQVAETransformer`，见 `vqvae.py`）**
-  - Encoder：NdLinear 或 Conv1d + Transformer
-  - Vector Quantizer：
-    - 普通 VQ (`VectorQuantize`)
-    - Residual VQ (`ResidualVQ`) + TikTok token 压缩
-    - 正交正则化（Orthogonal Regularization）
-  - Decoder：由外部传入的解码器，将量化后的 code 重建回原始特征空间
-  - 输入输出接口（简化）：
-    - 输入：`(B, L, D_in)` + `mask`
-    - 输出：`(decoder_output, indices, vq_loss, codebook_usage_info, ...)`
-
-- **损失函数**
-  - 重建损失（reconstruction loss）：
-    - 在原始边级特征空间计算 MSE：`MSE(decoder_output, edge_feats)`（对有效 mask 位置）
-  - VQ 损失：
-    - commitment loss + codebook 更新等
-  - 总损失：
-    - `loss_total = loss_recon + 0.1 * loss_vq`（权重可在 `compute_total_loss` 中调节）
-
-- **优化与调度器**
-  - 对 GCPNet + Featuriser + FeatureProjector + VQ-VAE 使用分组学习率
-  - 使用 `GradScaler + autocast()` 实现混合精度训练
-  - 使用 `scheduler.step(...)` 实现学习率调度（如 cosine decay）
-
-### 3.4 训练流程概览
-
-1. **单 batch 维度检查**：
-   - 在正式训练前，取一个 batch 做前向传播：
-   - 检查 `decoder_output.shape` 是否与 `edge_feats.shape` 一致
-   - 若不一致则抛出 `RuntimeError('Decoder output dimension mismatch')`
-
-2. **正式训练循环**：
-   - `for epoch in 1..NUM_EPOCHS`：
-     - 对每个 batch：
-       - `edge_feats, mask → GPU`
-       - `projected_feats = feature_projector(edge_feats)`
-       - `outputs = vqvae_model(projected_feats, mask, nan_mask)`
-       - `total_loss, loss_dict = compute_total_loss(outputs, edge_feats, mask, vq_weight=0.1)`
-       - 反向传播 + `clip_grad_norm_` + `optimizer.step()`
-     - 收集所有 batch 的 VQ code indices，计算 codebook 使用率：
-       - `unique_codes = torch.unique(indices)`
-       - `codebook_usage = len(unique_codes) / codebook_size`
-     - 将 `total_loss / recon_loss / vq_loss / codebook_usage` 记录到 `train_history`
-
-3. **Checkpoint 保存**：
-   - 每 `SAVE_INTERVAL` 个 epoch（或最后一个 epoch）保存：
-     - `gcpnet_encoder.state_dict()`
-     - `featuriser.state_dict()`
-     - `feature_projector.state_dict()`
-     - `vqvae_model.state_dict()`
-     - `optimizer`, `scheduler` 状态
-     - `train_history`
-     - `config`：将 VQ-VAE 与 GCPNet 的配置 dict 一并存入
-
-
-
----
-
-## 4. 项目文件索引
-
-```text
+```
 notebook-lab/
 ├── README.md                              # 本文件
 ├── .gitignore                             # Git 忽略文件配置
@@ -325,3 +106,281 @@ notebook-lab/
 │
 ├── inference_encode.py                    # 推理脚本 1：单独编码蛋白/配体/相互作用图
 └── inference_embed.py                     # 推理脚本 2：批量生成 binding embeddings
+
+```
+
+---
+
+## 🗂️ 数据说明
+
+### 输入数据
+
+#### 1. PDB 复合物数据集
+
+- **路径**：`complex-20251129T063258Z-1-001/complex/`
+- **数量**：3432 个 PDB 文件
+- **内容**：蛋白-配体复合物结构（包含 `ATOM` 和 `HETATM` 记录）
+- **命名**：按整数编号（0.pdb, 1.pdb, ..., 3431.pdb）
+
+### 输出数据
+
+#### 1. `binding_sites.csv`（25,626 条记录）
+
+由 `PDB_complex_analysis.ipynb` 或 `full_pipeline.py` 生成，记录所有蛋白残基与配体的空间接触关系。
+
+| 列名              | 说明                  | 示例    |
+| ----------------- | --------------------- | ------- |
+| `pdb_id`          | PDB 文件编号          | `0`     |
+| `protein_chain`   | 蛋白链 ID             | `A`     |
+| `protein_resnum`  | 残基序号              | `7`     |
+| `protein_icode`   | 插入码                | ` `     |
+| `protein_resname` | 残基名称              | `VAL`   |
+| `ligand_resname`  | 配体名称              | `FAD`   |
+| `ligand_chain`    | 配体链 ID             | `B`     |
+| `ligand_resnum`   | 配体残基号            | `1`     |
+| `ligand_icode`    | 配体插入码            | ` `     |
+| `min_distance`    | 最小原子-原子距离 (Å) | `3.055` |
+
+**用途**：
+
+- 标记关键结合位点（distance ≤ 4.0 Å）
+- 构建蛋白 binding 残基子图的节点掩码
+
+#### 2. 边级融合特征（257 维）
+
+由 `full_pipeline.py` 生成，包含边级局部特征和三图 embedding 的融合。
+
+**特征维度拆分**：
+
+- `feat_0` ~ `feat_127`：源节点（蛋白残基）的 GCPNet 嵌入（128 维）
+- `feat_128` ~ `feat_255`：目标节点（配体原子）的 GCPNet 嵌入（128 维）
+- `feat_256`：边距离特征（1 维）
+
+**用途**：
+
+- VQ-VAE 训练的输入特征
+- 边级离散表示学习
+
+---
+
+## 🚀 使用流程
+
+### 环境依赖
+
+```bash
+# Python 3.8+
+pip install torch torch-geometric biopython pandas numpy omegaconf pyyaml h5py
+pip install x-transformers vector-quantize-pytorch ndlinear  # VQ-VAE 训练
+pip install graphein  # 如需使用 Graphein 的角度计算功能
+```
+
+### 🔥 快速开始：完整流水线
+
+#### 方式 1：一键运行完整 pipeline（推荐）
+
+```bash
+cd "feature extraction"
+python full_pipeline.py
+```
+
+**输出**：
+
+- `improtant data/binding_sites.h5` - 蛋白-配体接触信息
+- `improtant data/binding_embeddings_*.h5` - 三图 embedding（蛋白、配体、相互作用）
+- `improtant data/binding_edge_features.h5` - 边级局部特征
+- `improtant data/binding_edge_features_fused.h5` - **最终融合特征（用于 VQ-VAE 训练）**
+
+**处理流程**：
+
+1. 分析 3432 个 PDB 文件 → 识别 25,626 条接触记录
+2. 构建三张图并用 GCPNet 编码 → 生成 3,139 个样本的 embedding
+3. 提取 13,798 条边的局部特征
+4. 融合四个文件生成最终的边级特征矩阵（257 维）
+
+**预计时间**：10-30 分钟（取决于机器性能）
+
+#### 方式 2：分步运行（调试用）
+
+### Step 1：识别结合位点
+
+运行 `PDB_complex_analysis.ipynb`：
+
+1. 设置路径参数（PDB 目录、输出 CSV 路径）
+2. 配置距离阈值（默认 4.0 Å）和忽略的 HET 残基（水分子、离子等）
+3. 批量解析 PDB，计算残基-配体最小距离
+4. 导出 `binding_sites.csv`
+
+**关键代码单元**：
+
+```python
+# 设置参数
+DIST_CUTOFF = 4.0
+IGNORED_HET = {"HOH", "WAT", "NA", "K", "CL", ...}
+
+# 运行分析
+analyze_all_pdbs(PDB_DIR, OUTPUT_CSV)
+```
+
+### Step 2：VQ-VAE 离散码本训练
+
+运行 `binding_edge_codebook.ipynb`：
+
+**Part 1：Edge 级几何码本（Cells 1-9）**
+
+- 读取 `binding_edge_features_fused.csv`（13,798 条边 × 257 维）
+- 使用简单 MLP 将边特征映射到 VQ 空间（128 维）
+- 训练 VQ 码本（4096 个 codes）
+- 导出 `binding_edge_codes.csv`
+
+**Part 2：完整 VQ-VAE 训练（Cells 10-17）**
+
+- 读取 `improtant data/binding_edge_features_fused.h5`
+- 使用 FeatureProjector 将 257 维投影到 128 维
+- 完整 VQ-VAE 架构：
+  - GCPNet encoder → Transformer encoder → Vector Quantizer → Geometric Decoder
+  - 多任务损失：MSE + backbone distance/direction + next-token prediction + VQ loss
+- 保存 checkpoint 到 `checkpoints/vqvae_edge_features/`
+
+**关键代码**：
+
+```python
+# Part 1: Edge 码本训练
+edge_encoder = EdgeToVQSpace(257, 128)
+vq_layer = model.vector_quantizer
+# 训练并导出 edge_code
+
+# Part 2: 完整 VQ-VAE 训练
+feature_projector = FeatureProjector(257, 128)
+full_vqvae = VQVAETransformer(configs, decoder, logger)
+# 训练并保存 checkpoint
+```
+
+---
+
+## 📊 关键配置文件
+
+### `config_gcpnet_encoder.yaml`
+
+GCPNet 编码器的完整配置，包括：
+
+- **特征提取器**：
+  - 节点标量特征：氨基酸 one-hot、序列位置编码、主链角度（α、κ、二面角）
+  - 节点向量特征：backbone 方向
+  - 边特征：距离、归一化向量
+
+- **编码器结构**：
+  - 6 层 GCP（Geometric-Complete Pairwise）消息传递
+  - 节点标量/向量维度：128/16
+  - 边标量/向量维度：32/4
+  - 径向基函数：8 个高斯基（r_max=10.0 Å）
+  - 激活函数：SiLU
+  - Pooling：sum
+
+### `config_vqvae.yaml`
+
+VQ-VAE 训练的完整配置，包括：
+
+- **模型结构**：
+  - GCPNet encoder（预训练）
+  - Transformer encoder：8 层，1024 维
+  - Vector Quantizer：4096 codes，128 维，EMA 更新
+  - TikTok 压缩：8 倍压缩因子
+  - Geometric Decoder：重建 backbone 坐标
+
+- **训练设置**：
+  - Batch size：4-8（根据 GPU 内存）
+  - Learning rate：1e-4
+  - Optimizer：AdamW
+  - Mixed precision：FP16
+  - Max length：512（序列长度）
+
+- **损失函数**：
+  - MSE loss（重建损失）
+  - VQ loss（码本损失，权重 0.1）
+  - Backbone distance/direction loss（几何约束）
+  - Next-token prediction loss（自回归）
+
+---
+
+## 📖 详细文档
+
+- **`gcpnet_README.md`**：gcpnet 模块的完整 API 说明与即插即用指南
+- **`data_analyzer/PDB复合物分析指南.md`**：PDB 解析与接触分析的详细步骤
+- **`binding_edge_codebook.ipynb`**：⭐ 主流程文档，包含 Edge 码本和完整 VQ-VAE 训练的详细说明
+- **Notebook 内嵌文档**：每个 Cell 都有中文注释和 Markdown 说明
+
+## 🎯 核心文件说明
+
+### ⭐⭐⭐ `binding_edge_codebook.ipynb`
+
+**最重要的 notebook**，包含两套独立的 VQ 码本训练流程：
+
+#### Part 1：Edge 级几何码本（Cells 1-9）
+
+- **目标**：为蛋白-配体结合边建立离散码本
+- **输入**：`binding_edge_features_fused.csv`（13,798 条边 × 257 维）
+- **输出**：`binding_edge_codes.csv`（每条边的离散 code）
+- **用途**：下游边级离散表示
+
+#### Part 2：完整 VQ-VAE 训练（Cells 10-17）
+
+- **目标**：完整实现 `vqvae.py` 的蛋白质结构生成模型
+- **输入**：`improtant data/binding_edge_features_fused.h5`
+- **输出**：`checkpoints/vqvae_edge_features/epoch_*.pth`
+- **架构**：GCPNet + Transformer + VQ + Geometric Decoder
+- **用途**：结构生成、压缩、离散表示学习
+
+### ⭐⭐ `feature extraction/full_pipeline.py`
+
+**完整的自动化流水线脚本**：
+
+- 一键完成从 PDB 分析到边级特征融合的全流程
+- 输出 HDF5 格式数据（高效、压缩、支持大规模数据）
+- 处理 3432 个 PDB 文件，生成 13,798 条边的融合特征
+
+---
+
+## 🔧 扩展与自定义
+
+### 修改距离阈值
+
+在 `PDB_complex_analysis.ipynb` 或 `full_pipeline.py` 中修改：
+
+```python
+DIST_CUTOFF = 5.0  # 例如改为 5 Å
+```
+
+### 更换 GCPNet 配置
+
+编辑 `config_gcpnet_encoder.yaml`，调整：
+
+- `num_layers`：网络深度
+- `emb_dim`：节点嵌入维度
+- `r_max`、`num_rbf`：径向基参数
+
+### 添加新的特征
+
+在 `ProteinFeaturiser` 中启用更多特征：
+
+```python
+featuriser = ProteinFeaturiser(
+    scalar_node_features=["amino_acid_one_hot", "dihedrals", "alpha", "kappa"],
+    vector_node_features=["orientation"],
+    ...
+)
+```
+
+---
+
+## 📈 数据规模统计
+
+| 数据项      | 数量/维度   | 说明                                |
+| ----------- | ----------- | ----------------------------------- |
+| PDB 文件    | 3,432 个    | 蛋白-配体复合物                     |
+| 接触记录    | 25,626 条   | 距离 ≤ 4.0 Å 的残基-配体对          |
+| 样本数      | 3,139 个    | (pdb_id, ligand) 组合               |
+| 边数        | 13,798 条   | 相互作用图的蛋白-配体边             |
+| 边特征维度  | 257 维      | [h_src(128) + h_dst(128) + dist(1)] |
+| VQ 码本大小 | 4,096 codes | 离散码本容量                        |
+| VQ 空间维度 | 128 维      | 量化后的特征维度                    |
+

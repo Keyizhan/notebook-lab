@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# 大型数据文件（超过 100MB 不建议提交到 GitHub）
+*.h5
+binding_edge_features_gcpnet.csv
+improtant data/
+
+# 临时文件
+test_*.py
+*.tmp
+
+# 训练输出
+checkpoints/
+*.pth
+*.ckpt
+
+# 环境
+venv/
+env/
+.venv

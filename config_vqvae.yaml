@@ -33,10 +33,10 @@ model:
       dim: 128
       decay: 0.99
       codebook_size: 4096
-      commitment_weight: 0.25
-      orthogonal_reg_weight: 10
-      orthogonal_reg_max_codes: 512
-      orthogonal_reg_active_codes_only: True
+      commitment_weight: 0.5  # 0.25 → 0.5，强制 encoder 靠近 codebook
+      orthogonal_reg_weight: 10  # 正交正则化权重：λ_orth * ||e_i^T e_j||_F^2，防止代码冗余
+      orthogonal_reg_max_codes: 512  # 每次采样 512 个 codes 计算正交损失（节省内存）
+      orthogonal_reg_active_codes_only: True  # 只对活跃的 codes 计算（提升效率）
       rotation_trick: True
       threshold_ema_dead_code: 2
       kmeans_init: True
@@ -45,9 +45,9 @@ model:
       sample_codebook_temp: 0.1
       alpha: 1.0
       tik_tok:
-        enabled: True
+        enabled: False  # 禁用 TikTok 以保持序列长度
         compression_factor: 8
-        residual_depth: 1
+        residual_depth: 4  # 启用 4 层 Residual VQ
         classifier_weight: 0.1
         adaptive_coefficient: True
     encoder:

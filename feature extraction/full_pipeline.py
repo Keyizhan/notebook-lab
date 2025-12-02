@@ -8,6 +8,13 @@
 4. 生成边级局部特征并融合
 5. 所有输出保存为 HDF5 格式
 
+模型架构升级：
+- 蛋白图编码器：完整版 GCPNet（6层，128维标量 + 16维向量特征）
+- 配体图编码器：GCPNet 架构（替代原 SimpleLigandEncoder MLP）
+- 相互作用图编码器：GCPNet 架构（替代原 SimpleLigandEncoder MLP）
+- 特征提取：使用完整的 ProteinFeaturiser，包含 alpha、kappa、dihedrals 等几何特征
+- 配置来源：config_gcpnet_encoder.yaml
+
 输出文件（HDF5）：
 - binding_sites.h5                    # 蛋白-配体接触信息
 - binding_embeddings_protein.h5       # 蛋白图级 embedding
@@ -330,17 +337,24 @@ def build_pyg_data_for_group(
     
     y = torch.zeros(N, dtype=torch.long)
     for row in group_rows:
-        cid = str(row["protein_chain"])
-        rnum = int(row["protein_resnum"])
+        # row 是 namedtuple，使用属性访问
+        cid = str(row.protein_chain)
+        rnum = int(row.protein_resnum)
         idx = index_map.get((cid, rnum))
         if idx is not None:
             y[idx] = 1
     
+    # GCPNet featuriser 需要 coords 为 (N, 2, 3) 格式
+    # 对于 CA-only 表示，两帧都使用 CA 坐标
+    coords_3d = torch.stack([coords, coords], dim=1)  # (N, 2, 3)
+    
     data = Data()
     data.pos = coords
+    data.coords = coords_3d  # ← 关键：在这里添加 coords
     data.residue_type = res_type_ids
     data.edge_index = edge_index
     data.y = y
+    data.seq_pos = torch.arange(N, dtype=torch.long)  # ← 添加 seq_pos
     data.pdb_id = pdb_id
     data.ligand_resname = lig_resname
     data.ligand_chain = lig_chain
@@ -351,12 +365,9 @@ def build_pyg_data_for_group(
 
 def to_batch_for_featuriser(data_list: List[Data]) -> Batch:
     """合并为 Batch 供 ProteinFeaturiser 使用。"""
+    # 现在 coords 和 seq_pos 已经在 Data 对象中了
+    # Batch.from_data_list 会自动处理它们的切片
     batch = Batch.from_data_list(data_list)
-    pos = batch.pos
-    zeros = torch.zeros_like(pos)
-    coords = torch.stack([zeros, pos], dim=1)
-    batch.coords = coords
-    batch.seq_pos = torch.arange(pos.size(0), dtype=torch.long)
     return batch
 
 
@@ -473,47 +484,105 @@ def build_interaction_graph(protein_data: Data, ligand_data: Data) -> Data:
 # Part 5: GCPNet 编码器初始化
 # ============================================================
 
+# 完整版 GCPNet featuriser 配置（匹配 config_gcpnet_encoder.yaml）
 featuriser = ProteinFeaturiser(
     representation="CA",
-    scalar_node_features=["amino_acid_one_hot"],
-    vector_node_features=[],
+    scalar_node_features=[
+        "amino_acid_one_hot",
+        "sequence_positional_encoding",
+        "alpha",
+        "kappa",
+        "dihedrals"
+    ],
+    vector_node_features=["orientation"],
     edge_types=["knn_16"],
     scalar_edge_features=["edge_distance"],
     vector_edge_features=["edge_vectors"],
 )
 
+# 从 YAML 加载完整版 GCPNet 配置
+from types import SimpleNamespace
+
 gcpnet_cfg_path = BASE_DIR / "config_gcpnet_encoder.yaml"
 gcpnet_configs = OmegaConf.load(str(gcpnet_cfg_path))
-gcpnet_kwargs = gcpnet_configs.encoder.kwargs
+
+# 转换配置为可用格式
+enc_kwargs_dict = OmegaConf.to_container(gcpnet_configs.encoder.kwargs, resolve=True)
+
+def dict_to_namespace(d):
+    """递归地将字典转换为 SimpleNamespace"""
+    if isinstance(d, dict):
+        return SimpleNamespace(**{k: dict_to_namespace(v) for k, v in d.items()})
+    elif isinstance(d, list):
+        return [dict_to_namespace(item) for item in d]
+    else:
+        return d
+
+# 构建 GCPNet encoder 参数
+gcpnet_kwargs = {
+    'num_layers': enc_kwargs_dict['num_layers'],
+    'emb_dim': enc_kwargs_dict['emb_dim'],
+    'node_s_emb_dim': enc_kwargs_dict['node_s_emb_dim'],
+    'node_v_emb_dim': enc_kwargs_dict['node_v_emb_dim'],
+    'edge_s_emb_dim': enc_kwargs_dict['edge_s_emb_dim'],
+    'edge_v_emb_dim': enc_kwargs_dict['edge_v_emb_dim'],
+    'r_max': enc_kwargs_dict['r_max'],
+    'num_rbf': enc_kwargs_dict['num_rbf'],
+    'activation': enc_kwargs_dict['activation'],
+    'pool': enc_kwargs_dict['pool'],
+    'module_cfg': dict_to_namespace(enc_kwargs_dict['module_cfg']),
+    'model_cfg': dict_to_namespace(enc_kwargs_dict['model_cfg']),
+    'layer_cfg': dict_to_namespace(enc_kwargs_dict['layer_cfg']),
+}
+
 gcpnet_encoder = GCPNetModel(**gcpnet_kwargs)
 gcpnet_encoder.eval()
 
-
-class SimpleLigandEncoder(nn.Module):
-    def __init__(self, in_dim=9, hidden_dim=64, out_dim=128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-    
-    def forward(self, atom_type_onehot):
-        return self.net(atom_type_onehot)
+print(f"[OK] GCPNet 编码器初始化成功")
+print(f"  - 层数: {gcpnet_kwargs['num_layers']}")
+print(f"  - 节点标量维度: {gcpnet_kwargs['node_s_emb_dim']}")
+print(f"  - 节点向量维度: {gcpnet_kwargs['node_v_emb_dim']}")
 
 
-ligand_encoder = SimpleLigandEncoder()
+# 配体和相互作用图也使用 GCPNet 架构
+# 为配体和相互作用图创建独立的 GCPNet 编码器
+ligand_encoder = GCPNetModel(**gcpnet_kwargs)
 ligand_encoder.eval()
 
-interaction_encoder = SimpleLigandEncoder(in_dim=1, hidden_dim=64, out_dim=128)
+interaction_encoder = GCPNetModel(**gcpnet_kwargs)
 interaction_encoder.eval()
 
+print(f"[OK] 配体编码器和相互作用编码器初始化成功")
 
-def encode_protein_graph(protein_batch: Batch) -> torch.Tensor:
-    """编码蛋白图。"""
+
+def _prepare_gcpnet_batch(batch: Batch) -> Batch:
+    """准备 GCPNet 所需的批次格式"""
+    # 确保 batch 有 h, chi, e, xi 字段
+    if not hasattr(batch, 'h'):
+        batch.h = batch.x if hasattr(batch, 'x') else torch.zeros(batch.pos.size(0), gcpnet_kwargs['model_cfg'].h_input_dim)
+    if not hasattr(batch, 'chi'):
+        batch.chi = getattr(batch, 'x_vector_attr', torch.zeros(batch.pos.size(0), gcpnet_kwargs['model_cfg'].chi_input_dim, 3))
+    if not hasattr(batch, 'e'):
+        batch.e = getattr(batch, 'edge_attr', torch.zeros(batch.edge_index.size(1), gcpnet_kwargs['model_cfg'].e_input_dim))
+    if not hasattr(batch, 'xi'):
+        batch.xi = getattr(batch, 'edge_vector_attr', torch.zeros(batch.edge_index.size(1), gcpnet_kwargs['model_cfg'].xi_input_dim, 3))
+    return batch
+
+
+def encode_protein_graph(protein_batch: Batch) -> dict:
+    """编码蛋白图，返回字典包含 node_embedding 和 graph_embedding。"""
     with torch.no_grad():
+        # 使用 featuriser 提取特征
         protein_batch = featuriser(protein_batch)
-        h_nodes = gcpnet_encoder(protein_batch)
+        
+        # 准备 GCPNet 格式
+        protein_batch = _prepare_gcpnet_batch(protein_batch)
+        
+        # GCPNet 前向传播
+        output = gcpnet_encoder(protein_batch)
+        
+        # GCPNet 返回字典: {'node_embedding': ..., 'graph_embedding': ...}
+        h_nodes = output['node_embedding']
         
         graph_idx = protein_batch.batch
         y = protein_batch.y
@@ -532,44 +601,120 @@ def encode_protein_graph(protein_batch: Batch) -> torch.Tensor:
                 h_pooled = h_g.mean(dim=0)
             h_list.append(h_pooled)
         
-        return torch.stack(h_list, dim=0)
+        graph_embeddings = torch.stack(h_list, dim=0)
+        
+        return {
+            'node_embedding': h_nodes,
+            'graph_embedding': graph_embeddings
+        }
 
 
 def encode_ligand_graph(ligand_data_list: List[Data]) -> torch.Tensor:
-    """编码配体图。"""
+    """编码配体图（使用 GCPNet）。"""
     with torch.no_grad():
         h_list = []
         for data in ligand_data_list:
+            # 为配体构建简单的节点特征
             atom_type = data.atom_type
             atom_type_onehot = torch.nn.functional.one_hot(
                 atom_type, num_classes=UNKNOWN_ATOM_ID + 1
             ).float()
-            h_atoms = ligand_encoder(atom_type_onehot)
+            
+            # 准备 GCPNet 输入
+            data.h = atom_type_onehot
+            data.chi = torch.zeros(atom_type.size(0), gcpnet_kwargs['model_cfg'].chi_input_dim, 3)
+            
+            # 计算边特征
+            edge_index = data.edge_index
+            if edge_index.size(1) > 0:
+                src, dst = edge_index
+                edge_vec = data.pos[dst] - data.pos[src]
+                edge_dist = torch.norm(edge_vec, dim=-1, keepdim=True)
+                data.e = edge_dist
+                data.xi = edge_vec.unsqueeze(1)  # [E, 1, 3]
+            else:
+                data.e = torch.zeros(0, gcpnet_kwargs['model_cfg'].e_input_dim)
+                data.xi = torch.zeros(0, gcpnet_kwargs['model_cfg'].xi_input_dim, 3)
+            
+            data.batch = torch.zeros(atom_type.size(0), dtype=torch.long)
+            
+            # GCPNet 编码
+            output = ligand_encoder(data)
+            h_atoms = output['node_embedding']
             h_pooled = h_atoms.mean(dim=0)
             h_list.append(h_pooled)
+        
         return torch.stack(h_list, dim=0)
 
 
 def encode_interaction_graph(inter_data_list: List[Data]) -> torch.Tensor:
-    """编码相互作用图。"""
+    """编码相互作用图（使用 GCPNet）。"""
     with torch.no_grad():
         h_list = []
         for data in inter_data_list:
-            node_role = data.node_role.unsqueeze(-1).float()
-            h_nodes = interaction_encoder(node_role)
+            # 为相互作用图构建节点特征（基于节点角色）
+            node_role = data.node_role
+            node_role_onehot = torch.nn.functional.one_hot(node_role, num_classes=2).float()
+            
+            # 准备 GCPNet 输入
+            data.h = node_role_onehot
+            data.chi = torch.zeros(node_role.size(0), gcpnet_kwargs['model_cfg'].chi_input_dim, 3)
+            
+            # 计算边特征
+            edge_index = data.edge_index
+            if edge_index.size(1) > 0:
+                src, dst = edge_index
+                edge_vec = data.pos[dst] - data.pos[src]
+                edge_dist = torch.norm(edge_vec, dim=-1, keepdim=True)
+                data.e = edge_dist
+                data.xi = edge_vec.unsqueeze(1)  # [E, 1, 3]
+            else:
+                data.e = torch.zeros(0, gcpnet_kwargs['model_cfg'].e_input_dim)
+                data.xi = torch.zeros(0, gcpnet_kwargs['model_cfg'].xi_input_dim, 3)
+            
+            data.batch = torch.zeros(node_role.size(0), dtype=torch.long)
+            
+            # GCPNet 编码
+            output = interaction_encoder(data)
+            h_nodes = output['node_embedding']
             h_pooled = h_nodes.mean(dim=0)
             h_list.append(h_pooled)
+        
         return torch.stack(h_list, dim=0)
 
 
 def encode_interaction_graph_nodes(inter_data_list: List[Data]) -> List[torch.Tensor]:
-    """编码相互作用图节点（用于边级特征）。"""
+    """编码相互作用图节点（用于边级特征，使用 GCPNet）。"""
     with torch.no_grad():
         h_nodes_list = []
         for data in inter_data_list:
-            node_role = data.node_role.unsqueeze(-1).float()
-            h_nodes = interaction_encoder(node_role)
+            # 为相互作用图构建节点特征
+            node_role = data.node_role
+            node_role_onehot = torch.nn.functional.one_hot(node_role, num_classes=2).float()
+            
+            # 准备 GCPNet 输入
+            data.h = node_role_onehot
+            data.chi = torch.zeros(node_role.size(0), gcpnet_kwargs['model_cfg'].chi_input_dim, 3)
+            
+            # 计算边特征
+            edge_index = data.edge_index
+            if edge_index.size(1) > 0:
+                src, dst = edge_index
+                edge_vec = data.pos[dst] - data.pos[src]
+                edge_dist = torch.norm(edge_vec, dim=-1, keepdim=True)
+                data.e = edge_dist
+                data.xi = edge_vec.unsqueeze(1)  # [E, 1, 3]
+            else:
+                data.e = torch.zeros(0, gcpnet_kwargs['model_cfg'].e_input_dim)
+                data.xi = torch.zeros(0, gcpnet_kwargs['model_cfg'].xi_input_dim, 3)
+            
+            data.batch = torch.zeros(node_role.size(0), dtype=torch.long)
+            
+            # GCPNet 编码
+            output = interaction_encoder(data)
+            h_nodes = output['node_embedding']
             h_nodes_list.append(h_nodes)
+        
         return h_nodes_list
 
 
@@ -581,58 +726,99 @@ def compute_and_save_triplet_embeddings(
     pdb_dir: Path,
     binding_groups: dict,
     max_groups: Optional[int] = None,
+    batch_size: int = 100,  # ← 分批处理，避免内存溢出
 ):
-    """计算三图 embedding 并保存为 HDF5。"""
+    """计算三图 embedding 并保存为 HDF5（分批处理）。"""
     keys = list(binding_groups.keys())
     if max_groups is not None:
         keys = keys[:max_groups]
     
-    print(f"\n[Triplet Embeddings] 处理 {len(keys)} 个样本...")
+    print(f"\n[Triplet Embeddings] 处理 {len(keys)} 个样本（批大小: {batch_size}）...")
     
-    protein_data_list = []
-    ligand_data_list = []
-    inter_data_list = []
-    meta_list = []
+    # 用于累积所有批次的结果
+    all_h_protein = []
+    all_h_ligand = []
+    all_h_inter = []
+    all_meta = []
     
-    for i, key in enumerate(keys, 1):
-        if i % 100 == 0 or i == len(keys):
-            print(f"  进度: {i}/{len(keys)}", end="\r")
+    # 分批处理
+    num_batches = (len(keys) + batch_size - 1) // batch_size
+    
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, len(keys))
+        batch_keys = keys[start_idx:end_idx]
         
-        group_rows = binding_groups[key]
-        pdb_id, lig_resname, lig_chain, lig_resnum = key
-        pdb_path = pdb_dir / f"{pdb_id}.pdb"
+        print(f"\n[Batch {batch_idx + 1}/{num_batches}] 处理样本 {start_idx + 1}-{end_idx}...")
         
-        protein_data = build_pyg_data_for_group(pdb_dir, key, group_rows)
-        if protein_data is None:
+        protein_data_list = []
+        ligand_data_list = []
+        inter_data_list = []
+        meta_list = []
+        
+        for i, key in enumerate(batch_keys, 1):
+            if i % 20 == 0 or i == len(batch_keys):
+                print(f"  构建图: {i}/{len(batch_keys)}", end="\r")
+            
+            group_rows = binding_groups[key]
+            pdb_id, lig_resname, lig_chain, lig_resnum = key
+            pdb_path = pdb_dir / f"{pdb_id}.pdb"
+            
+            protein_data = build_pyg_data_for_group(pdb_dir, key, group_rows)
+            if protein_data is None:
+                continue
+            
+            ligand_data = build_ligand_graph_from_pdb(pdb_path, lig_resname, lig_chain, lig_resnum)
+            if ligand_data is None:
+                continue
+            
+            inter_data = build_interaction_graph(protein_data, ligand_data)
+            
+            protein_data_list.append(protein_data)
+            ligand_data_list.append(ligand_data)
+            inter_data_list.append(inter_data)
+            meta_list.append(key)
+        
+        print(f"\n  成功构建 {len(protein_data_list)} 个样本")
+        
+        if not protein_data_list:
+            print("  跳过此批次（无有效样本）")
             continue
         
-        ligand_data = build_ligand_graph_from_pdb(pdb_path, lig_resname, lig_chain, lig_resnum)
-        if ligand_data is None:
-            continue
+        # 编码三图（当前批次）
+        print("  编码蛋白图...")
+        protein_batch = to_batch_for_featuriser(protein_data_list)
+        h_protein = encode_protein_graph(protein_batch)['graph_embedding'].cpu().numpy()
         
-        inter_data = build_interaction_graph(protein_data, ligand_data)
+        print("  编码配体图...")
+        h_ligand = encode_ligand_graph(ligand_data_list).cpu().numpy()
         
-        protein_data_list.append(protein_data)
-        ligand_data_list.append(ligand_data)
-        inter_data_list.append(inter_data)
-        meta_list.append(key)
+        print("  编码相互作用图...")
+        h_inter = encode_interaction_graph(inter_data_list).cpu().numpy()
+        
+        # 累积结果
+        all_h_protein.append(h_protein)
+        all_h_ligand.append(h_ligand)
+        all_h_inter.append(h_inter)
+        all_meta.extend(meta_list)
+        
+        # 清理内存
+        del protein_data_list, ligand_data_list, inter_data_list
+        del protein_batch, h_protein, h_ligand, h_inter
+        import gc
+        gc.collect()
     
-    print(f"\n  成功构建 {len(protein_data_list)} 个样本")
+    # 合并所有批次的结果
+    print(f"\n[Triplet Embeddings] 合并所有批次的结果...")
+    h_protein = np.vstack(all_h_protein)
+    h_ligand = np.vstack(all_h_ligand)
+    h_inter = np.vstack(all_h_inter)
+    meta_list = all_meta
     
-    if not protein_data_list:
-        print("没有成功构建的样本。")
-        return
-    
-    # 编码三图
-    print("\n[Triplet Embeddings] 编码蛋白图...")
-    protein_batch = to_batch_for_featuriser(protein_data_list)
-    h_protein = encode_protein_graph(protein_batch).cpu().numpy()
-    
-    print("[Triplet Embeddings] 编码配体图...")
-    h_ligand = encode_ligand_graph(ligand_data_list).cpu().numpy()
-    
-    print("[Triplet Embeddings] 编码相互作用图...")
-    h_inter = encode_interaction_graph(inter_data_list).cpu().numpy()
+    print(f"  总样本数: {len(meta_list)}")
+    print(f"  蛋白 embedding shape: {h_protein.shape}")
+    print(f"  配体 embedding shape: {h_ligand.shape}")
+    print(f"  相互作用 embedding shape: {h_inter.shape}")
     
     # 保存为 HDF5
     meta_arrays = {
@@ -876,9 +1062,15 @@ def fuse_edge_and_graph_embeddings():
     with h5py.File(FUSED_EDGE_FEATURES_H5, 'w') as f:
         f.create_dataset('features', data=fused_features)
         
-        # 保存元信息
+        # 保存元信息（字符串需要转换为字节类型）
         for key, val in edge_meta.items():
-            f.create_dataset(key, data=val)
+            if key in ['pdb_id', 'ligand_resname', 'ligand_chain']:
+                # 字符串类型转换为字节
+                val_bytes = np.array([s.encode('utf-8') for s in val], dtype='S')
+                f.create_dataset(key, data=val_bytes)
+            else:
+                # 数值类型直接保存
+                f.create_dataset(key, data=val)
         
         f.attrs['num_edges'] = len(fused_features)
         f.attrs['feature_dim'] = fused_features.shape[1]
@@ -939,7 +1131,7 @@ def main():
     fuse_edge_and_graph_embeddings()
     
     print("\n" + "=" * 70)
-    print("✓ 完整流水线执行完成！")
+    print("[SUCCESS] 完整流水线执行完成！")
     print("=" * 70)
     print(f"\n输出文件（HDF5 格式）：")
     print(f"  1. {BINDING_SITES_H5}")
